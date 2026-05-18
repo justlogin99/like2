@@ -22,7 +22,7 @@ except ImportError:
 # 配置
 # ============================================================
 MAX_CAPTCHA_ATTEMPTS = 3        # 单次 reCAPTCHA 最大尝试次数
-MAX_RETRIES_PER_ID = 20         # 每个 ID 最大重试次数（含换 IP）
+MAX_RETRIES_PER_ID = 10         # 每个 ID 最大重试次数（含换 IP）
 SCREENSHOT_DIR = "output/screenshots"
 
 # ============================================================
