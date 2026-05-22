@@ -2,8 +2,8 @@ name: Deploy
 
 on:
   workflow_dispatch:
-  #schedule:
-    #- cron: '0 */1 * * *'
+  schedule:
+    - cron: '0 */1 * * *'
   repository_dispatch:
     types: [service-down-alert]
 
