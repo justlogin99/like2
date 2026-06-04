@@ -21,30 +21,10 @@ except ImportError:
 # ============================================================
 # 配置
 # ============================================================
+BASE_URL = "https://godlike.cool"
 MAX_CAPTCHA_ATTEMPTS = 2        # 单次 reCAPTCHA 最大尝试次数
-MAX_RETRIES_PER_ID = 8         # 每个 ID 最大重试次数（含换 IP）
+MAX_RETRIES_PER_ID = 5         # 每个 ID 最大重试次数（含换 IP）
 SCREENSHOT_DIR = "output/screenshots"
-
-# ============================================================
-# 脱敏辅助函数 (隐私保护)
-# ============================================================
-def mask_text(text: str, keep: int = 4) -> str:
-    """保留字符串前几位，后面替换为星号（如 a87cdc70 -> a87c****）"""
-    if not text:
-        return ""
-    if len(text) <= keep:
-        return "****"
-    return text[:keep] + "****"
-
-def mask_url(url: str, keep: int = 4) -> str:
-    """对 URL 的最后路径部分进行脱敏"""
-    if not url:
-        return ""
-    parts = url.split('/')
-    # 对最后一个斜杠后面的内容进行脱敏
-    if len(parts) > 0 and parts[-1]:
-        parts[-1] = mask_text(parts[-1], keep)
-    return '/'.join(parts)
 
 # ============================================================
 # 日志
@@ -103,9 +83,12 @@ def send_tg_photo(token: str, chat_id: str, photo_path: str, caption: str):
         log(f"Telegram 文本通知也失败: {e}", "ERROR")
 
 
-def build_caption(status: str, target_url: str, input_id: str,
-                  reason: str = "") -> str:
-    """构建通知文本 (TG 是私密的，这里保留明文方便查看)"""
+def build_caption(status: str, godlike_id: str, reason: str = "") -> str:
+    """构建通知文本
+    status: 'success' | 'maxed' | 'cooldown' | 'failure'
+    """
+    url = f"{BASE_URL}/{godlike_id}"
+    
     if status == "success":
         title = "✅ 续订成功"
     elif status == "maxed":
@@ -115,7 +98,7 @@ def build_caption(status: str, target_url: str, input_id: str,
     else:
         title = "❌ 续订失败"
     
-    lines = [title, "", f"URL: {target_url}", f"输入ID: {input_id}"]
+    lines = [title, "", f"URL: {url}"]
     if reason and status == "failure":
         lines.append(f"原因: {reason}")
     lines += ["", "Godlike Host Auto Renew"]
@@ -186,6 +169,7 @@ def _get_frame(page, kind: str):
 
 def _is_solved(page) -> bool:
     """检测 reCAPTCHA 是否已通过"""
+    # 方式1：检查隐藏 textarea 的 token
     try:
         token = page.run_js(
             "return document.querySelector(\"textarea[name='g-recaptcha-response']\")?.value"
@@ -194,6 +178,7 @@ def _is_solved(page) -> bool:
             return True
     except Exception:
         pass
+    # 方式2：anchor frame aria-checked
     anchor = _get_frame(page, "anchor")
     if anchor:
         try:
@@ -253,6 +238,7 @@ def _switch_to_audio(page) -> bool:
     if not bframe:
         return False
 
+    # 已经在音频模式
     try:
         inp = bframe.ele('#audio-response', timeout=1)
         if inp and inp.states.is_displayed:
@@ -386,6 +372,7 @@ def _fill_and_verify(page, text: str):
 
 def solve_recaptcha(page) -> bool:
     """完整的 reCAPTCHA 破解流程，返回是否成功"""
+    # 等待 reCAPTCHA 加载
     for _ in range(20):
         if _get_frame(page, "anchor"):
             break
@@ -404,6 +391,7 @@ def solve_recaptcha(page) -> bool:
         if _is_blocked(page):
             raise CaptchaBlocked("IP 被 reCAPTCHA 封锁")
 
+        # 第一次点击复选框
         if attempt == 0:
             _click_checkbox(page)
             time.sleep(2)
@@ -411,6 +399,7 @@ def solve_recaptcha(page) -> bool:
                 log("复选框点击后直接通过（无图形验证）")
                 return True
 
+        # 切换音频模式
         if not _switch_to_audio(page):
             log("无法切换到音频模式，重试", "WARN")
             time.sleep(3)
@@ -421,6 +410,7 @@ def solve_recaptcha(page) -> bool:
         if _is_blocked(page):
             raise CaptchaBlocked("切换音频后 IP 被封锁")
 
+        # 获取音频 URL
         audio_url = _get_audio_url(page)
         if not audio_url:
             log("未获取到音频 URL，刷新挑战", "WARN")
@@ -428,6 +418,7 @@ def solve_recaptcha(page) -> bool:
             time.sleep(3)
             continue
 
+        # 下载音频
         mp3 = _download_audio(audio_url)
         if not mp3:
             dl_fail_count += 1
@@ -439,6 +430,7 @@ def solve_recaptcha(page) -> bool:
             continue
         dl_fail_count = 0
 
+        # 识别音频
         text = _recognize_audio(mp3)
         try:
             os.remove(mp3)
@@ -482,11 +474,14 @@ def build_page() -> ChromiumPage:
     co.set_argument('--disable-popup-blocking')
     co.set_argument('--window-size=1280,720')
     co.set_argument('--log-level=3')
+    # 独立用户数据目录避免残留
     co.set_user_data_path(tempfile.mkdtemp())
     co.auto_port()
     co.headless(False)
 
     page = ChromiumPage(co)
+
+    # 反指纹注入
     page.add_init_js("""
         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
         Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
@@ -501,16 +496,13 @@ def build_page() -> ChromiumPage:
     return page
 
 # ============================================================
-# 单个任务续期
+# 单个 ID 续期
 # ============================================================
-def renew_single_id(target_url: str, input_id: str, tg_token: str, tg_chat_id: str):
-    """对单个任务执行续期，包含换 IP 重试"""
-    # 提前准备脱敏后的变量用于控制台输出
-    m_url = mask_url(target_url)
-    m_id = mask_text(input_id)
-    
+def renew_single_id(godlike_id: str, tg_token: str, tg_chat_id: str):
+    """对单个 Godlike ID 执行续期，包含换 IP 重试，不填用户名"""
+    page_url = f"{BASE_URL}/{godlike_id}"
     log(f"{'='*60}")
-    log(f"处理任务 -> URL: {m_url} | ID: {m_id}")
+    log(f"处理账号: {page_url}")
     log(f"{'='*60}")
 
     success = False
@@ -524,32 +516,18 @@ def renew_single_id(target_url: str, input_id: str, tg_token: str, tg_chat_id: s
             page = build_page()
 
             # ── 1. 访问续期页面 ──────────────────────────────
-            log(f"访问: {m_url}")
-            page.get(target_url, retry=3)  # 这里传的仍然是真实的 target_url
+            log(f"访问: {page_url}")
+            page.get(page_url, retry=3)
             time.sleep(random.uniform(4, 7))
 
+            # 检查页面是否正常加载
             page_html = page.html or ""
             if "Public Free Server Renewal" not in page_html:
                 failure_reason = "页面加载异常"
                 log(failure_reason, "WARN")
                 continue
 
-            # ── 2. 填写指定的 ID ──────────────────────────────
-            log(f"向输入框填写指定ID: {m_id}")
-            
-            username_input = page.ele('xpath://input[@name="username"]', timeout=5)
-            if not username_input:
-                failure_reason = "未找到用户名输入框"
-                log(failure_reason, "ERROR")
-                break
-
-            username_input.click()
-            time.sleep(random.uniform(0.3, 0.8))
-            username_input.clear()
-            username_input.input(input_id)  # 这里传的仍然是真实的 input_id
-            time.sleep(random.uniform(0.5, 1.0))
-
-            # ── 3. 模拟人类行为 ──────────────────────────────
+            # ── 2. 模拟人类行为（不触碰任何输入框）────────────
             for _ in range(2):
                 page.scroll.down(random.randint(100, 300))
                 time.sleep(random.uniform(0.5, 1.2))
@@ -559,7 +537,7 @@ def renew_single_id(target_url: str, input_id: str, tg_token: str, tg_chat_id: s
                 )
                 time.sleep(random.uniform(0.3, 0.8))
 
-            # ── 4. 破解 reCAPTCHA ────────────────────────────
+            # ── 3. 破解 reCAPTCHA ────────────────────────────
             log("开始破解 reCAPTCHA...")
             try:
                 solved = solve_recaptcha(page)
@@ -568,7 +546,7 @@ def renew_single_id(target_url: str, input_id: str, tg_token: str, tg_chat_id: s
                 failure_reason = "IP 被 reCAPTCHA 封锁"
                 screenshot_path = screenshot(
                     page,
-                    f"godlike-{m_id}-blocked-{attempt}.png"
+                    f"godlike-{godlike_id}-blocked-{attempt}.png"
                 )
                 page.quit()
                 page = None
@@ -583,9 +561,10 @@ def renew_single_id(target_url: str, input_id: str, tg_token: str, tg_chat_id: s
             if not solved:
                 failure_reason = "reCAPTCHA 未通过"
                 log(failure_reason, "WARN")
+                # 换 IP 重试
                 screenshot_path = screenshot(
                     page,
-                    f"godlike-{m_id}-unsolved-{attempt}.png"
+                    f"godlike-{godlike_id}-unsolved-{attempt}.png"
                 )
                 page.quit()
                 page = None
@@ -593,7 +572,7 @@ def renew_single_id(target_url: str, input_id: str, tg_token: str, tg_chat_id: s
                 time.sleep(5)
                 continue
 
-            # ── 5. 提交表单 ──────────────────────────────────
+            # ── 4. 提交表单 ──────────────────────────────────
             log("reCAPTCHA 通过，点击 Renew Server 提交...")
             submit_btn = page.ele('xpath://button[@type="submit"]', timeout=5)
             if not submit_btn:
@@ -608,7 +587,7 @@ def renew_single_id(target_url: str, input_id: str, tg_token: str, tg_chat_id: s
             except Exception:
                 submit_btn.click(by_js=True)
 
-            # ── 6. 等待结果 ──────────────────────────────────
+            # ── 5. 等待结果 ──────────────────────────────────
             time.sleep(8)
             result_html = page.html or ""
 
@@ -619,7 +598,7 @@ def renew_single_id(target_url: str, input_id: str, tg_token: str, tg_chat_id: s
                 final_status = "success"
                 screenshot_path = screenshot(
                     page,
-                    f"godlike-{m_id}-success.png"
+                    f"godlike-{godlike_id}-success.png"
                 )
                 break
 
@@ -630,7 +609,7 @@ def renew_single_id(target_url: str, input_id: str, tg_token: str, tg_chat_id: s
                 failure_reason = "已达24小时上限"
                 screenshot_path = screenshot(
                     page,
-                    f"godlike-{m_id}-maxed.png"
+                    f"godlike-{godlike_id}-maxed.png"
                 )
                 break
 
@@ -642,7 +621,7 @@ def renew_single_id(target_url: str, input_id: str, tg_token: str, tg_chat_id: s
                 failure_reason = "6分钟冷却期"
                 screenshot_path = screenshot(
                     page,
-                    f"godlike-{m_id}-cooldown.png"
+                    f"godlike-{godlike_id}-cooldown.png"
                 )
                 break
 
@@ -652,8 +631,9 @@ def renew_single_id(target_url: str, input_id: str, tg_token: str, tg_chat_id: s
                 failure_reason = "提交后未检测到结果"
                 screenshot_path = screenshot(
                     page,
-                    f"godlike-{m_id}-unknown-{attempt}.png"
+                    f"godlike-{godlike_id}-unknown-{attempt}.png"
                 )
+                # 换 IP 重试
                 page.quit()
                 page = None
                 restart_warp()
@@ -666,7 +646,7 @@ def renew_single_id(target_url: str, input_id: str, tg_token: str, tg_chat_id: s
             if page:
                 screenshot_path = screenshot(
                     page,
-                    f"godlike-{m_id}-error-{attempt}.png"
+                    f"godlike-{godlike_id}-error-{attempt}.png"
                 )
             if attempt < MAX_RETRIES_PER_ID:
                 if page:
@@ -682,17 +662,18 @@ def renew_single_id(target_url: str, input_id: str, tg_token: str, tg_chat_id: s
 
         finally:
             if page:
+                # 如果还没截图，在退出前补一张
                 if not screenshot_path:
                     screenshot_path = screenshot(
                         page,
-                        f"godlike-{m_id}-final-{attempt}.png"
+                        f"godlike-{godlike_id}-final-{attempt}.png"
                     )
                 try:
                     page.quit()
                 except Exception:
                     pass
 
-    # ── 7. 发送 Telegram 通知 ──────────────────────────────
+    # ── 6. 发送 Telegram 通知 ──────────────────────────────
     if 'final_status' not in locals():
         if success:
             final_status = "success"
@@ -703,11 +684,9 @@ def renew_single_id(target_url: str, input_id: str, tg_token: str, tg_chat_id: s
         else:
             final_status = "failure"
 
-    # 注意：发送给 TG 机器人的通知，依然使用未打码的真实 target_url 和 input_id，方便你自己查看
     caption = build_caption(
         status=final_status,
-        target_url=target_url,
-        input_id=input_id,
+        godlike_id=godlike_id,
         reason=failure_reason,
     )
     send_tg_photo(tg_token, tg_chat_id, screenshot_path, caption)
@@ -715,36 +694,45 @@ def renew_single_id(target_url: str, input_id: str, tg_token: str, tg_chat_id: s
     return success
 
 # ============================================================
-# 主入口
+# 主入口（支持手动指定部分 ID）
 # ============================================================
 def main():
     # ── 读取环境变量 ────────────────────────────────────────
-    raw_info = os.getenv("INFO", "").strip()
-    tg_token = os.getenv("TG_BOT_TOKEN", "").strip()
-    tg_chat_id = os.getenv("TG_CHAT_ID", "").strip()
+    raw_ids_secret = os.getenv("GODLIKE_ID", "").strip()
+    raw_ids_input  = os.getenv("GODLIKE_ID_INPUT", "").strip()
+    tg_token       = os.getenv("TG_BOT_TOKEN", "").strip()
+    tg_chat_id     = os.getenv("TG_CHAT_ID", "").strip()
 
-    if not raw_info:
-        log("INFO 环境变量未配置，退出", "ERROR")
+    if not raw_ids_secret:
+        log("GODLIKE_ID 未配置，退出", "ERROR")
         sys.exit(1)
 
-    # ── 解析 INFO 变量 (格式: url---id) ──────────────────────
-    tasks = []
-    lines = [line.strip() for line in raw_info.replace(",", "\n").splitlines() if line.strip()]
-    
-    for line in lines:
-        if "---" in line:
-            parts = line.split("---", 1)
-            target_url = parts[0].strip()
-            input_id = parts[1].strip()
-            tasks.append((target_url, input_id))
-        else:
-            log(f"格式错误，忽略此行 (缺少 '---')", "WARN") # 脱敏忽略的行内容
+    # ── 解析全部 ID（来自 Secret）───────────────────────────
+    def parse_ids(raw: str) -> list[str]:
+        return [
+            line.strip()
+            for line in raw.replace(",", "\n").splitlines()
+            if line.strip()
+        ]
 
-    if not tasks:
-        log("没有解析到有效的任务，退出", "ERROR")
-        sys.exit(1)
+    all_ids = parse_ids(raw_ids_secret)
 
-    log(f"成功解析到 {len(tasks)} 个任务")
+    # ── 处理手动输入的指定 ID ───────────────────────────────
+    if raw_ids_input:
+        input_ids = parse_ids(raw_ids_input)
+        
+        # 校验：输入的 ID 必须存在于 Secret 中
+        invalid = [i for i in input_ids if i not in all_ids]
+        if invalid:
+            log(f"以下 ID 不在 GODLIKE_ID 中，已忽略: {invalid}", "WARN")
+        godlike_id = [i for i in input_ids if i in all_ids]
+        if not godlike_id:
+            log("指定的 ID 全部无效，退出", "ERROR")
+            sys.exit(1)
+        log(f"手动指定模式，共 {len(godlike_id)} 个账号: {godlike_id}")
+    else:
+        godlike_id = all_ids
+        log(f"自动模式，共 {len(godlike_id)} 个账号: {godlike_id}")
 
     # ── 启动虚拟显示 ─────────────────────────────────────────
     vdisplay = Xvfb(width=1280, height=720, colordepth=24)
@@ -752,24 +740,25 @@ def main():
 
     total_success = 0
     try:
-        for idx, (target_url, input_id) in enumerate(tasks, 1):
+        for idx, gid in enumerate(godlike_id, 1):
             log(f"\n{'#'*60}")
-            log(f"执行进度: {idx}/{len(tasks)}")
+            log(f"账号 {idx}/{len(godlike_id)}: {gid}")
             log(f"{'#'*60}")
 
-            ok = renew_single_id(target_url, input_id, tg_token, tg_chat_id)
+            ok = renew_single_id(gid, tg_token, tg_chat_id)
             if ok:
                 total_success += 1
 
-            if idx < len(tasks):
+            # 多账号之间稍作间隔
+            if idx < len(godlike_id):
                 wait = random.randint(5, 15)
-                log(f"等待 {wait} 秒后处理下一个任务...")
+                log(f"等待 {wait} 秒后处理下一个账号...")
                 time.sleep(wait)
     finally:
         vdisplay.stop()
 
-    log(f"\n全部完成：成功 {total_success}/{len(tasks)}")
-    if total_success < len(tasks):
+    log(f"\n全部完成：成功 {total_success}/{len(godlike_id)}")
+    if total_success < len(godlike_id):
         sys.exit(1)
 
 
