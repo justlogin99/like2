@@ -4,6 +4,10 @@ on:
     - cron: '0 */3 * * *'
   workflow_dispatch:
 
+permissions:
+  actions: write
+  contents: read
+
 jobs:
   add_time_job:
     name: 运行续期脚本
@@ -331,7 +335,6 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
-        # 替换为执行 renew.py
         run: python renew.py
 
       - name: 清理历史
