@@ -1,12 +1,8 @@
 name: Godlike URL 续期
-
 on:
   workflow_dispatch:
-    inputs:
-      accounts:
-        description: '指定ID（留空运行全部）'
-        required: false
-        default: ''
+  schedule:
+    - cron: '0 */3 * * *'
 
 permissions:
   actions: write
@@ -16,7 +12,6 @@ jobs:
   run-renew:
     name: 执行续期脚本
     runs-on: ubuntu-latest
-
     steps:
       - name: 拉取仓库
         uses: actions/checkout@v4
@@ -61,20 +56,19 @@ jobs:
 
       - name: 执行续订
         env:
-          GODLIKE_ID: ${{ secrets.GODLIKE_ID }}
-          GODLIKE_ID_INPUT: ${{ github.event.inputs.accounts }}
+          INFO: ${{ secrets.INFO }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python renew.py
+        run: python main.py
 
-      - name: 上传截图
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: screenshots-${{ github.run_number }}
-          path: output/screenshots/*.png
-          retention-days: 7
-          if-no-files-found: ignore
+      # - name: 上传截图
+      #   if: always()
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: screenshots-${{ github.run_number }}
+      #     path: output/screenshots/*.png
+      #     retention-days: 7
+      #     if-no-files-found: ignore
 
       - name: 清理历史运行记录
         if: always()
@@ -84,4 +78,4 @@ jobs:
           repository: ${{ github.repository }}
           delete_workflow_pattern: ${{ github.workflow }}
           retain_days: 0
-          keep_minimum_runs: 2
+          keep_minimum_runs: 1
