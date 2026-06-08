@@ -1,409 +1,777 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-import os, sys, time, traceback, random
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
-from typing import Optional, Dict, List, Any
-
+import os
+import sys
+import time
+import random
+import html
+import tempfile
+import subprocess
 import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from xvfbwrapper import Xvfb
+from DrissionPage import ChromiumPage, ChromiumOptions
 
-# ---------- 配置 ----------
-API_BASE = "https://panel.godlike.host"
-OUTPUT_DIR = Path("Godlike")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-CN_TZ = timezone(timedelta(hours=8))
+try:
+    import speech_recognition as sr
+    from pydub import AudioSegment
+except ImportError:
+    pass
 
-# ---------- 工具函数 ----------
-def cn_time():
-    return datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+# ============================================================
+# 配置
+# ============================================================
+MAX_CAPTCHA_ATTEMPTS = 3        # 单次 reCAPTCHA 最大尝试次数
+MAX_RETRIES_PER_ID = 3         # 每个 ID 最大重试次数（含换 IP）
+SCREENSHOT_DIR = "output/screenshots"
 
-def mask_email(email: str) -> str:
-    if not email or "@" not in email:
-        return "***"
-    user, domain = email.split("@", 1)
-    return f"{user[:3]}***@{domain}"
+# ============================================================
+# 脱敏辅助函数 (隐私保护)
+# ============================================================
+def mask_text(text: str, keep: int = 4) -> str:
+    """保留字符串前几位，后面替换为星号（如 a87cdc70 -> a87c****）"""
+    if not text:
+        return ""
+    if len(text) <= keep:
+        return "****"
+    return text[:keep] + "****"
 
-def mask_server(server_id: str) -> str:
-    if not server_id or len(server_id) < 6:
-        return "***"
-    return f"{server_id[:3]}***{server_id[-3:]}"
+def mask_url(url: str, keep: int = 4) -> str:
+    """对 URL 的最后路径部分进行脱敏"""
+    if not url:
+        return ""
+    parts = url.split('/')
+    # 对最后一个斜杠后面的内容进行脱敏
+    if len(parts) > 0 and parts[-1]:
+        parts[-1] = mask_text(parts[-1], keep)
+    return '/'.join(parts)
 
-def snapshot(name: str) -> str:
-    return str(OUTPUT_DIR / f"{name}_{int(time.time())}.png")
+# ============================================================
+# 日志
+# ============================================================
+def log(msg: str, level: str = "INFO"):
+    tag = {"INFO": "[INFO]", "WARN": "[WARN]", "ERROR": "[ERROR]"}.get(level, "[INFO]")
+    print(f"{tag} {msg}", flush=True)
 
-def notify_tg(ok: bool, email: str = "", server: str = "",
-              before: str = "", after: str = "",
-              error_msg: str = "", screenshot: str = None):
-    token = os.environ.get("TG_BOT_TOKEN")
-    chat_id = os.environ.get("TG_CHAT_ID")
+# ============================================================
+# 自定义异常
+# ============================================================
+class CaptchaBlocked(Exception):
+    """IP 被 reCAPTCHA 封锁"""
+    pass
+
+class CooldownActive(Exception):
+    """服务器处于冷却期"""
+    pass
+
+# ============================================================
+# Telegram 通知
+# ============================================================
+def send_tg_photo(token: str, chat_id: str, photo_path: str, caption: str):
+    """发送带截图的 Telegram 通知"""
     if not token or not chat_id:
+        log("未配置 TG_BOT_TOKEN / TG_CHAT_ID，跳过通知", "WARN")
         return
 
-    msg = "✅ 续期成功\n\n" if ok else "❌ 续期失败\n\n"
-    if email:   msg += f"账号：{email}\n"
-    if server:  msg += f"服务器：{server}\n"
-    if ok:
-        if before and after:
-            msg += f"到期：{before} → {after}\n"
-        elif after:
-            msg += f"到期：{after}\n"
-        elif before:
-            msg += f"到期：{before}\n"
+    api_url = f"https://api.telegram.org/bot{token}/sendPhoto"
+
+    if photo_path and os.path.exists(photo_path):
+        try:
+            with open(photo_path, "rb") as f:
+                resp = requests.post(
+                    api_url,
+                    data={"chat_id": chat_id, "caption": caption},
+                    files={"photo": f},
+                    timeout=30,
+                )
+            resp.raise_for_status()
+            log("Telegram 图片通知已发送")
+            return
+        except Exception as e:
+            log(f"Telegram 图片通知失败，尝试纯文本: {e}", "WARN")
+
+    # 没有截图时发纯文本
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": chat_id, "text": caption},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        log("Telegram 文本通知已发送")
+    except Exception as e:
+        log(f"Telegram 文本通知也失败: {e}", "ERROR")
+
+
+def build_caption(status: str, target_url: str, input_id: str,
+                  reason: str = "") -> str:
+    """构建通知文本 (TG 是私密的，这里保留明文方便查看)"""
+    if status == "success":
+        title = "✅ 续订成功"
+    elif status == "maxed":
+        title = "⏳ 24小时上限"
+    elif status == "cooldown":
+        title = "⏳ 6分钟冷却期"
     else:
-        if error_msg: msg += f"原因：{error_msg}\n"
-        if before:    msg += f"上次到期：{before}\n"
-        if after:     msg += f"现在到期：{after}\n"
-    msg += "\nGodlike Host Auto Renew"
+        title = "❌ 续订失败"
+    
+    lines = [title, "", f"URL: {target_url}", f"输入ID: {input_id}"]
+    if reason and status == "failure":
+        lines.append(f"原因: {reason}")
+    lines += ["", "Godlike Host Auto Renew"]
+    return "\n".join(lines)
 
+# ============================================================
+# 截图
+# ============================================================
+def screenshot(page, name: str) -> str | None:
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    path = os.path.join(SCREENSHOT_DIR, name)
     try:
-        if screenshot and Path(screenshot).exists():
-            with open(screenshot, "rb") as f:
-                requests.post(
-                    f"https://api.telegram.org/bot{token}/sendPhoto",
-                    data={"chat_id": chat_id, "caption": msg},
-                    files={"photo": f}, timeout=30)
-        else:
-            requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": msg, "disable_web_page_preview": True},
-                timeout=30)
-        print("[INFO] TG 通知已发送", flush=True)
+        page.get_screenshot(path=path)
+        log(f"截图已保存: {path}")
+        return path
     except Exception as e:
-        print(f"[WARN] TG 通知发送失败: {e}", flush=True)
-
-# ---------- Secret 与 Cookie 处理 ----------
-def parse_raw_cookies(raw_cookie_str: str) -> List[Dict]:
-    """解析原生 Cookie 字符串，仅提取登录必需的核心 Cookie"""
-    if not raw_cookie_str:
-        return []
-    
-    # 防止用户不小心复制了 "Cookie: " 请求头前缀
-    if raw_cookie_str.lower().startswith("cookie: "):
-        raw_cookie_str = raw_cookie_str[8:]
-        
-    valid_cookies = []
-    
-    for item in raw_cookie_str.split(';'):
-        item = item.strip()
-        if not item or '=' not in item:
-            continue
-            
-        key, value = item.split('=', 1)
-        key = key.strip()
-        value = value.strip()
-        
-        # 仅保留 Pterodactyl 面板核心的会话/认证 Cookie
-        if key in ["pterodactyl_session", "XSRF-TOKEN"] or key.startswith("remember_web_"):
-            valid_cookies.append({
-                "name": key,
-                "value": value,
-                "domain": "panel.godlike.host",
-                "path": "/",
-                "secure": True
-            })
-            
-    return valid_cookies
-
-def parse_secret(raw: str) -> Dict[str, Any]:
-    parts = raw.strip().split("-----")
-    if len(parts) < 2:
-        raise ValueError("格式错误：必须提供账号和 Cookie 数据 (格式: 账号-----完整的Cookie字符串)")
-    
-    user = parts[0].strip()
-    # 剩下的部分全部拼接为 Cookie 字符串，防止 Cookie 本身包含 "-----" 导致被错误截断
-    raw_cookie = "-----".join(parts[1:]).strip()
-    
-    cookies = parse_raw_cookies(raw_cookie)
-    if not cookies:
-        print("[WARN] 警告：未能从提供的字符串中提取到核心登录 Cookie，请检查内容。", flush=True)
-            
-    return {"user": user, "cookies": cookies}
-
-# ---------- API 交互 ----------
-def api_get_servers(session: requests.Session) -> Optional[List[Dict]]:
-    try:
-        r = session.get(f"{API_BASE}/api/client",
-                        params={"page": 1, "sort": "creation", "asc": "true"},
-                        headers={"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"},
-                        timeout=30)
-        r.raise_for_status()
-        return r.json().get("data", [])
-    except Exception as e:
-        print(f"[ERROR] 获取服务器列表失败: {e}", flush=True)
+        log(f"截图失败: {e}", "WARN")
         return None
 
-def find_free_server(servers: List[Dict]) -> Optional[Dict]:
-    for srv in servers:
-        if srv["attributes"].get("free"):
-            return srv
-    return None
-
-def get_free_timer(session: requests.Session, uuid: str) -> Optional[str]:
-    servers = api_get_servers(session)
-    if servers:
-        for srv in servers:
-            if srv["attributes"]["uuid"] == uuid:
-                return srv["attributes"]["free_timer"]
-    return None
-
-def calc_remaining(timer: str) -> str:
-    if not timer:
-        return "未知"
+# ============================================================
+# WARP 换 IP
+# ============================================================
+def restart_warp() -> bool:
+    log("正在重启 WARP 更换 IP...")
     try:
-        expire = datetime.fromisoformat(timer.replace("Z", "+00:00"))
-        delta = expire - datetime.now(timezone.utc)
-        secs = int(delta.total_seconds())
-        if secs <= 0:
-            return "已过期"
-        d, rem = divmod(secs, 86400)
-        h, rem = divmod(rem, 3600)
-        m = rem // 60
-        parts = []
-        if d: parts.append(f"{d}天")
-        if h: parts.append(f"{h}小时")
-        if m: parts.append(f"{m}分钟")
-        return " ".join(parts) if parts else "<1分钟"
-    except:
-        return timer
+        old_ip = requests.get("https://api.ipify.org", timeout=10).text.strip()
+        log(f"当前 IP: {old_ip}")
+    except Exception:
+        old_ip = "未知"
 
-# ---------- Cookie 辅助 ----------
-def session_from_cookies(cookie_list: List[Dict]) -> requests.Session:
-    s = requests.Session()
-    for c in cookie_list:
-        s.cookies.set(
-            c.get("name"), c.get("value"),
-            domain=c.get("domain", "panel.godlike.host"),
-            path=c.get("path", "/"),
-        )
-    return s
+    cmds = [
+        ["sudo", "warp-cli", "--accept-tos", "disconnect"],
+        ["sudo", "warp-cli", "--accept-tos", "registration", "delete"],
+        ["sudo", "warp-cli", "--accept-tos", "registration", "new"],
+        ["sudo", "warp-cli", "--accept-tos", "connect"],
+    ]
+    for cmd in cmds:
+        try:
+            subprocess.run(cmd, check=True, timeout=30,
+                           capture_output=True)
+        except subprocess.CalledProcessError as e:
+            log(f"命令失败（忽略）: {' '.join(cmd)} → {e}", "WARN")
+        time.sleep(3)
 
-def test_cookie_valid(session: requests.Session) -> bool:
+    time.sleep(10)  # 等待 WARP 稳定
+
     try:
-        r = session.get(f"{API_BASE}/api/client",
-                        params={"page": 1},
-                        headers={"Accept": "application/json"},
-                        timeout=15)
-        return r.status_code == 200 and "data" in r.json()
-    except:
+        new_ip = requests.get("https://api.ipify.org", timeout=10).text.strip()
+        log(f"WARP 重连完成，新 IP: {new_ip}")
+        return new_ip != old_ip
+    except Exception as e:
+        log(f"获取新 IP 失败: {e}", "WARN")
         return False
 
-def safe_add_cookies(page, cookies):
-    if cookies:
-        page.context.add_cookies(cookies)
-        print(f"[INFO] 成功注入 {len(cookies)} 个核心 Cookie", flush=True)
-        print("[INFO] 刷新页面验证登录状态...", flush=True)
-        page.goto(API_BASE, wait_until="domcontentloaded")
-        page.wait_for_timeout(3000)
+# ============================================================
+# reCAPTCHA 辅助
+# ============================================================
+def _get_frame(page, kind: str):
+    """获取指定类型的 reCAPTCHA frame"""
+    try:
+        for frame in page.get_frames():
+            url = frame.url or ""
+            if "recaptcha" in url and kind in url:
+                return frame
+    except Exception:
+        pass
+    return None
 
-# ---------- 续期操作 ----------
-def do_renewal(page, server_short_id: str, max_retries: int = 3) -> bool:
-    url = f"{API_BASE}/server/{server_short_id}"
-    for attempt in range(1, max_retries + 1):
+def _is_solved(page) -> bool:
+    """检测 reCAPTCHA 是否已通过"""
+    try:
+        token = page.run_js(
+            "return document.querySelector(\"textarea[name='g-recaptcha-response']\")?.value"
+        )
+        if token and len(token) > 30:
+            return True
+    except Exception:
+        pass
+    anchor = _get_frame(page, "anchor")
+    if anchor:
         try:
-            if attempt == 1:
-                print("[INFO] 访问服务器页面...", flush=True)
-                page.goto(url, wait_until="domcontentloaded")
-            else:
-                print(f"[INFO] 第{attempt}次重试，刷新页面...", flush=True)
-                page.reload(wait_until="domcontentloaded")
+            checked = anchor.run_js(
+                "return document.querySelector('#recaptcha-anchor')"
+                "?.getAttribute('aria-checked') === 'true'"
+            )
+            if checked:
+                return True
+        except Exception:
+            pass
+    return False
 
-            page.wait_for_timeout(5000)
+def _is_blocked(page) -> bool:
+    """检测是否被 reCAPTCHA 封锁（'Try again later'）"""
+    bframe = _get_frame(page, "bframe")
+    if not bframe:
+        return False
+    try:
+        return bool(bframe.run_js("""
+            const h = document.querySelector('.rc-doscaptcha-header-text');
+            if (h && h.textContent.toLowerCase().includes('try again later')) return true;
+            return false;
+        """))
+    except Exception:
+        return False
 
-            # 检查是否仍然有前端错误
-            error_selectors = [
-                'text="An error was encountered"',
-                'text="error was encountered"',
-                'text="Try refreshing the page"'
-            ]
-            has_error = False
-            for sel in error_selectors:
-                loc = page.locator(sel)
-                if loc.count() > 0:
-                    print(f"[WARN] 检测到页面错误: {sel}，将重试...", flush=True)
-                    has_error = True
-                    break
+def _click_checkbox(page):
+    """点击 reCAPTCHA 复选框"""
+    anchor = None
+    for _ in range(30):
+        anchor = _get_frame(page, "anchor")
+        if anchor:
+            break
+        time.sleep(1)
+    if not anchor:
+        raise RuntimeError("未找到 reCAPTCHA anchor frame")
 
-            if has_error and attempt < max_retries:
+    cb = anchor.ele('#recaptcha-anchor', timeout=5)
+    if not cb:
+        raise RuntimeError("未找到复选框元素")
+
+    page.actions.move_to(cb, duration=random.uniform(0.4, 1.0))
+    time.sleep(random.uniform(0.2, 0.5))
+    try:
+        cb.click()
+    except Exception:
+        cb.click(by_js=True)
+    time.sleep(3)
+
+    if _is_blocked(page):
+        raise CaptchaBlocked("点击复选框后 IP 被封锁")
+
+def _switch_to_audio(page) -> bool:
+    """切换到音频验证模式"""
+    bframe = _get_frame(page, "bframe")
+    if not bframe:
+        return False
+
+    try:
+        inp = bframe.ele('#audio-response', timeout=1)
+        if inp and inp.states.is_displayed:
+            return True
+    except Exception:
+        pass
+
+    for _ in range(3):
+        try:
+            btn = bframe.ele('#recaptcha-audio-button', timeout=3)
+            if btn:
+                try:
+                    btn.click()
+                except Exception:
+                    btn.click(by_js=True)
+                time.sleep(3)
+                if _is_blocked(page):
+                    raise CaptchaBlocked("切换音频后 IP 被封锁")
+                inp = bframe.ele('#audio-response', timeout=1)
+                if inp and inp.states.is_displayed:
+                    return True
+        except CaptchaBlocked:
+            raise
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
+
+def _get_audio_url(page) -> str | None:
+    """获取音频挑战 URL"""
+    bframe = _get_frame(page, "bframe")
+    if not bframe:
+        return None
+    for _ in range(10):
+        try:
+            for sel in [
+                '.rc-audiochallenge-tdownload-link',
+                '.rc-audiochallenge-ndownload-link',
+                '#audio-source',
+            ]:
+                el = bframe.ele(sel, timeout=0.5)
+                if el:
+                    href = el.attr('href') or el.attr('src')
+                    if href and len(href) > 10:
+                        return html.unescape(href)
+        except Exception:
+            pass
+        time.sleep(1)
+    return None
+
+def _reload_challenge(page):
+    bframe = _get_frame(page, "bframe")
+    if not bframe:
+        return
+    try:
+        btn = bframe.ele('#recaptcha-reload-button', timeout=2)
+        if btn:
+            try:
+                btn.click()
+            except Exception:
+                btn.click(by_js=True)
+            time.sleep(3)
+    except Exception:
+        pass
+
+def _download_audio(url: str) -> str | None:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://www.google.com/",
+    }
+    variants = [url]
+    if "recaptcha.net" in url:
+        variants.append(url.replace("recaptcha.net", "www.google.com"))
+    elif "google.com" in url:
+        variants.append(url.replace("www.google.com", "recaptcha.net"))
+
+    for u in variants:
+        try:
+            r = requests.get(u, headers=headers, timeout=30)
+            r.raise_for_status()
+            if len(r.content) < 1000:
                 continue
-            elif has_error and attempt == max_retries:
-                print("[ERROR] 多次重试后页面仍存在错误", flush=True)
-                page.screenshot(path=snapshot("renewal_page_error"))
-                return False
+            path = tempfile.mktemp(suffix=".mp3")
+            with open(path, "wb") as f:
+                f.write(r.content)
+            return path
+        except Exception:
+            pass
+    return None
 
-            # 等待续期按钮
-            add_btn = page.locator('button:has-text("Add 90 minutes")')
-            add_btn.wait_for(state="visible", timeout=30000)
-            add_btn.click()
-            print("[INFO] 已点击 Add 90 minutes", flush=True)
+def _recognize_audio(mp3_path: str) -> str | None:
+    try:
+        wav_path = mp3_path.replace(".mp3", ".wav")
+        AudioSegment.from_mp3(mp3_path).export(wav_path, format="wav")
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as src:
+            audio = recognizer.record(src)
+        text = recognizer.recognize_google(audio)
+        try:
+            os.remove(wav_path)
+        except Exception:
+            pass
+        return text
+    except Exception as e:
+        log(f"音频识别失败: {e}", "WARN")
+        return None
 
-            ad_btn = page.locator('button:has-text("Watch advertisment")')
-            ad_btn.wait_for(state="visible", timeout=10000)
-            ad_btn.click()
-            print("[INFO] 已点击 Watch advertisment", flush=True)
+def _fill_and_verify(page, text: str):
+    bframe = _get_frame(page, "bframe")
+    if not bframe:
+        return
+    try:
+        inp = bframe.ele('#audio-response', timeout=2)
+        if inp:
+            inp.click()
+            inp.clear()
+            inp.input(text)
+            time.sleep(random.uniform(0.5, 1.2))
+        verify = bframe.ele('#recaptcha-verify-button', timeout=2)
+        if verify:
+            try:
+                verify.click()
+            except Exception:
+                verify.click(by_js=True)
+    except Exception as e:
+        log(f"填写验证码异常: {e}", "WARN")
 
-            print("[INFO] 等待广告 120 秒...", flush=True)
-            time.sleep(120)
+def solve_recaptcha(page) -> bool:
+    """完整的 reCAPTCHA 破解流程，返回是否成功"""
+    for _ in range(20):
+        if _get_frame(page, "anchor"):
+            break
+        time.sleep(1)
+    else:
+        raise RuntimeError("reCAPTCHA anchor frame 加载超时")
 
-            # 广告结束后刷新页面
-            page.reload(wait_until="domcontentloaded")
-            page.wait_for_timeout(3000)
+    dl_fail_count = 0
+
+    for attempt in range(MAX_CAPTCHA_ATTEMPTS):
+        log(f"reCAPTCHA 破解尝试 {attempt + 1}/{MAX_CAPTCHA_ATTEMPTS}")
+
+        if _is_solved(page):
+            log("reCAPTCHA 已通过")
+            return True
+        if _is_blocked(page):
+            raise CaptchaBlocked("IP 被 reCAPTCHA 封锁")
+
+        if attempt == 0:
+            _click_checkbox(page)
+            time.sleep(2)
+            if _is_solved(page):
+                log("复选框点击后直接通过（无图形验证）")
+                return True
+
+        if not _switch_to_audio(page):
+            log("无法切换到音频模式，重试", "WARN")
+            time.sleep(3)
+            continue
+
+        time.sleep(random.uniform(2, 4))
+
+        if _is_blocked(page):
+            raise CaptchaBlocked("切换音频后 IP 被封锁")
+
+        audio_url = _get_audio_url(page)
+        if not audio_url:
+            log("未获取到音频 URL，刷新挑战", "WARN")
+            _reload_challenge(page)
+            time.sleep(3)
+            continue
+
+        mp3 = _download_audio(audio_url)
+        if not mp3:
+            dl_fail_count += 1
+            log(f"音频下载失败（第{dl_fail_count}次）", "WARN")
+            if dl_fail_count >= 3:
+                raise RuntimeError("音频连续下载失败3次")
+            _reload_challenge(page)
+            time.sleep(random.uniform(3, 6))
+            continue
+        dl_fail_count = 0
+
+        text = _recognize_audio(mp3)
+        try:
+            os.remove(mp3)
+        except Exception:
+            pass
+
+        if not text:
+            log("音频识别失败，刷新挑战", "WARN")
+            _reload_challenge(page)
+            time.sleep(3)
+            continue
+
+        log(f"识别结果: [{text}]")
+        _fill_and_verify(page, text)
+        time.sleep(5)
+
+        if _is_solved(page):
+            log("reCAPTCHA 验证通过！")
             return True
 
-        except PlaywrightTimeoutError:
-            print(f"[ERROR] 第{attempt}次：续期按钮未出现", flush=True)
-            if attempt < max_retries:
-                continue
-            page.screenshot(path=snapshot("renewal_not_found"))
-            return False
-        except Exception as e:
-            print(f"[ERROR] 续期异常 (重试{attempt}): {e}", flush=True)
-            if attempt < max_retries:
-                continue
-            page.screenshot(path=snapshot("renewal_error"))
-            return False
+        log("验证未通过，刷新挑战重试", "WARN")
+        _reload_challenge(page)
+        time.sleep(random.uniform(2, 4))
 
     return False
 
-# ---------- 单账号流程 ----------
-def process_account(key: str, proxy: str = None) -> bool:
-    raw = os.environ.get(key, "").strip()
-    if not raw:
-        return True
+# ============================================================
+# 构建 Chrome 实例
+# ============================================================
+def build_page() -> ChromiumPage:
+    co = ChromiumOptions()
+    co.set_browser_path('/usr/bin/google-chrome')
+    co.set_argument('--no-sandbox')
+    co.set_argument('--disable-dev-shm-usage')
+    co.set_argument('--disable-gpu')
+    co.set_argument('--disable-setuid-sandbox')
+    co.set_argument('--disable-software-rasterizer')
+    co.set_argument('--disable-extensions')
+    co.set_argument('--no-first-run')
+    co.set_argument('--no-default-browser-check')
+    co.set_argument('--disable-popup-blocking')
+    co.set_argument('--window-size=1280,720')
+    co.set_argument('--log-level=3')
+    co.set_user_data_path(tempfile.mkdtemp())
+    co.auto_port()
+    co.headless(False)
 
-    try:
-        sec = parse_secret(raw)
-    except Exception as e:
-        print(f"[ERROR] {key} 格式错误: {e}", flush=True)
-        notify_tg(False, email="", error_msg=str(e))
-        return False
+    page = ChromiumPage(co)
+    page.add_init_js("""
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+        Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+        const getP = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(p) {
+            if (p === 37445) return 'Intel Inc.';
+            if (p === 37446) return 'Intel(R) UHD Graphics 630';
+            return getP.apply(this, [p]);
+        };
+    """)
+    return page
 
-    user = sec["user"]
-    cookielist = sec["cookies"]
-    display_user = mask_email(user)
+# ============================================================
+# 单个任务续期
+# ============================================================
+def renew_single_id(target_url: str, input_id: str, tg_token: str, tg_chat_id: str):
+    """对单个任务执行续期，包含换 IP 重试"""
+    # 提前准备脱敏后的变量用于控制台输出
+    m_url = mask_url(target_url)
+    m_id = mask_text(input_id)
+    
+    log(f"{'='*60}")
+    log(f"处理任务 -> URL: {m_url} | ID: {m_id}")
+    log(f"{'='*60}")
 
-    print(f"\n{'='*60}\n[INFO] 处理 {key} ({display_user})\n{'='*60}", flush=True)
+    success = False
+    failure_reason = ""
+    screenshot_path = None
 
-    if not cookielist:
-        print("[ERROR] 未提取到有效的核心 Cookie", flush=True)
-        notify_tg(False, email=user, error_msg="提取的 Cookie 无效，请检查提供的字符串")
-        return False
-
-    # 验证 Cookie
-    session = session_from_cookies(cookielist)
-    if test_cookie_valid(session):
-        print("[INFO] 🍪 Cookie 登录验证成功", flush=True)
-    else:
-        print("[ERROR] Cookie 已失效，无法登录", flush=True)
-        notify_tg(False, email=user, error_msg="Cookie 已失效，请手动更新环境变量")
-        return False
-
-    # 获取服务器
-    servers = api_get_servers(session)
-    if not servers:
-        notify_tg(False, email=user, error_msg="无法获取服务器列表")
-        return False
-    srv = find_free_server(servers)
-    if not srv:
-        notify_tg(False, email=user, error_msg="未找到免费服务器")
-        return False
-
-    uuid = srv["attributes"]["uuid"]
-    short_id = srv["attributes"]["identifier"]
-    before = calc_remaining(srv["attributes"].get("free_timer"))
-    print(f"服务器: {mask_server(uuid)}, 续期前剩余: {before}", flush=True)
-
-    if before == "已过期":
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, proxy={"server": proxy} if proxy else None)
-            page = browser.new_page()
-            safe_add_cookies(page, cookielist)
-            page.goto(f"{API_BASE}/server/{short_id}", wait_until="domcontentloaded")
-            page.wait_for_timeout(3000)
-            ss_path = snapshot("expired")
-            page.screenshot(path=ss_path)
-            browser.close()
-        notify_tg(False, email=user, server=short_id, before=before,
-                  error_msg="服务器已过期，无法续期", screenshot=ss_path)
-        return False
-
-    # 续期
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, proxy={"server": proxy} if proxy else None)
-        page = browser.new_page()
-        success_ss = None
+    for attempt in range(1, MAX_RETRIES_PER_ID + 1):
+        log(f"--- 尝试 {attempt}/{MAX_RETRIES_PER_ID} ---")
+        page = None
         try:
-            safe_add_cookies(page, cookielist)
-            if not do_renewal(page, short_id):
-                fail_ss = snapshot("renewal_fail")
-                page.screenshot(path=fail_ss)
-                notify_tg(False, email=user, server=short_id, before=before,
-                          error_msg="续期点击失败", screenshot=fail_ss)
-                return False
+            page = build_page()
 
-            after = calc_remaining(get_free_timer(session, uuid))
-            print(f"[INFO] 续期后剩余: {after}", flush=True)
+            # ── 1. 访问续期页面 ──────────────────────────────
+            log(f"访问: {m_url}")
+            page.get(target_url, retry=3)  # 这里传的仍然是真实的 target_url
+            time.sleep(random.uniform(4, 7))
 
-            success_ss = snapshot("success")
-            page.screenshot(path=success_ss)
+            page_html = page.html or ""
+            if "Public Free Server Renewal" not in page_html:
+                failure_reason = "页面加载异常"
+                log(failure_reason, "WARN")
+                continue
 
-            notify_tg(True, email=user, server=short_id, before=before, after=after,
-                      screenshot=success_ss)
-            print(f"[INFO] ✅ {key} 续期成功", flush=True)
-            return True
+            # ── 2. 填写指定的 ID ──────────────────────────────
+            log(f"向输入框填写指定ID: {m_id}")
+            
+            username_input = page.ele('xpath://input[@name="username"]', timeout=5)
+            if not username_input:
+                failure_reason = "未找到用户名输入框"
+                log(failure_reason, "ERROR")
+                break
+
+            username_input.click()
+            time.sleep(random.uniform(0.3, 0.8))
+            username_input.clear()
+            username_input.input(input_id)  # 这里传的仍然是真实的 input_id
+            time.sleep(random.uniform(0.5, 1.0))
+
+            # ── 3. 模拟人类行为 ──────────────────────────────
+            for _ in range(2):
+                page.scroll.down(random.randint(100, 300))
+                time.sleep(random.uniform(0.5, 1.2))
+                page.actions.move(
+                    random.randint(200, 900),
+                    random.randint(100, 500)
+                )
+                time.sleep(random.uniform(0.3, 0.8))
+
+            # ── 4. 破解 reCAPTCHA ────────────────────────────
+            log("开始破解 reCAPTCHA...")
+            try:
+                solved = solve_recaptcha(page)
+            except CaptchaBlocked:
+                log("IP 被封锁，换 IP 后重试", "WARN")
+                failure_reason = "IP 被 reCAPTCHA 封锁"
+                screenshot_path = screenshot(
+                    page,
+                    f"godlike-{m_id}-blocked-{attempt}.png"
+                )
+                page.quit()
+                page = None
+                restart_warp()
+                time.sleep(5)
+                continue
+            except Exception as e:
+                failure_reason = f"reCAPTCHA 异常: {e}"
+                log(failure_reason, "ERROR")
+                break
+
+            if not solved:
+                failure_reason = "reCAPTCHA 未通过"
+                log(failure_reason, "WARN")
+                screenshot_path = screenshot(
+                    page,
+                    f"godlike-{m_id}-unsolved-{attempt}.png"
+                )
+                page.quit()
+                page = None
+                restart_warp()
+                time.sleep(5)
+                continue
+
+            # ── 5. 提交表单 ──────────────────────────────────
+            log("reCAPTCHA 通过，点击 Renew Server 提交...")
+            submit_btn = page.ele('xpath://button[@type="submit"]', timeout=5)
+            if not submit_btn:
+                submit_btn = page.ele('xpath://button[contains(text(),"Renew Server")]', timeout=3)
+            if not submit_btn:
+                failure_reason = "未找到提交按钮"
+                log(failure_reason, "ERROR")
+                break
+
+            try:
+                submit_btn.click()
+            except Exception:
+                submit_btn.click(by_js=True)
+
+            # ── 6. 等待结果 ──────────────────────────────────
+            time.sleep(8)
+            result_html = page.html or ""
+
+            if ("successfully renewed" in result_html.lower() or
+                "server has been successfully renewed" in result_html.lower()):
+                log("✅ 续订成功！")
+                success = True
+                final_status = "success"
+                screenshot_path = screenshot(
+                    page,
+                    f"godlike-{m_id}-success.png"
+                )
+                break
+
+            elif "maximum of 24 hours" in result_html.lower():
+                log("⏳ 服务器已累积24小时续期上限，无需继续续期")
+                success = True
+                final_status = "maxed"
+                failure_reason = "已达24小时上限"
+                screenshot_path = screenshot(
+                    page,
+                    f"godlike-{m_id}-maxed.png"
+                )
+                break
+
+            elif ("already renewed" in result_html.lower() or
+                  "past 6 minutes" in result_html.lower()):
+                log("⏳ 服务器正处于冷却期（6分钟内已有人续订）")
+                success = False
+                final_status = "cooldown"
+                failure_reason = "6分钟冷却期"
+                screenshot_path = screenshot(
+                    page,
+                    f"godlike-{m_id}-cooldown.png"
+                )
+                break
+
+            else:
+                log("未检测到成功/冷却期标志，重试", "WARN")
+                final_status = None
+                failure_reason = "提交后未检测到结果"
+                screenshot_path = screenshot(
+                    page,
+                    f"godlike-{m_id}-unknown-{attempt}.png"
+                )
+                page.quit()
+                page = None
+                restart_warp()
+                time.sleep(5)
+                continue
 
         except Exception as e:
-            print(f"[ERROR] 续期流程异常: {e}", flush=True)
-            traceback.print_exc()
-            exc_ss = snapshot("exception")
-            try:
-                page.screenshot(path=exc_ss)
-            except:
-                pass
-            notify_tg(False, email=user, server=short_id, before=before,
-                      error_msg=f"脚本异常: {str(e)[:200]}", screenshot=exc_ss)
-            return False
+            log(f"续期异常: {e}", "ERROR")
+            failure_reason = f"运行异常: {str(e)[:200]}"
+            if page:
+                screenshot_path = screenshot(
+                    page,
+                    f"godlike-{m_id}-error-{attempt}.png"
+                )
+            if attempt < MAX_RETRIES_PER_ID:
+                if page:
+                    try:
+                        page.quit()
+                    except Exception:
+                        pass
+                    page = None
+                restart_warp()
+                time.sleep(5)
+                continue
+            break
+
         finally:
-            if success_ss is None:
+            if page:
+                if not screenshot_path:
+                    screenshot_path = screenshot(
+                        page,
+                        f"godlike-{m_id}-final-{attempt}.png"
+                    )
                 try:
-                    page.screenshot(path=snapshot("final_error"))
-                except:
+                    page.quit()
+                except Exception:
                     pass
-            browser.close()
 
+    # ── 7. 发送 Telegram 通知 ──────────────────────────────
+    if 'final_status' not in locals():
+        if success:
+            final_status = "success"
+        elif "冷却期" in (failure_reason or ""):
+            final_status = "cooldown"
+        elif "24小时" in (failure_reason or ""):
+            final_status = "maxed"
+        else:
+            final_status = "failure"
+
+    # 注意：发送给 TG 机器人的通知，依然使用未打码的真实 target_url 和 input_id，方便你自己查看
+    caption = build_caption(
+        status=final_status,
+        target_url=target_url,
+        input_id=input_id,
+        reason=failure_reason,
+    )
+    send_tg_photo(tg_token, tg_chat_id, screenshot_path, caption)
+
+    return success
+
+# ============================================================
+# 主入口
+# ============================================================
 def main():
-    proxy = os.environ.get("PROXY_SERVER", "")
-    if proxy:
-        print(f"[INFO] 代理: {proxy}", flush=True)
+    # ── 读取环境变量 ────────────────────────────────────────
+    raw_info = os.getenv("INFO", "").strip()
+    tg_token = os.getenv("TG_BOT_TOKEN", "").strip()
+    tg_chat_id = os.getenv("TG_CHAT_ID", "").strip()
 
-    accounts = [f"GODLIKE_{i}" for i in range(1, 6)]
-    all_ok = True
-    for idx, acc in enumerate(accounts):
-        try:
-            ok = process_account(acc, proxy if proxy else None)
-            if not ok:
-                all_ok = False
-        except Exception as e:
-            print(f"[FATAL] {acc} 崩溃: {e}", flush=True)
-            traceback.print_exc()
-            user = ""
-            try:
-                raw = os.environ.get(acc, "")
-                if raw:
-                    parts = raw.split("-----")
-                    if parts: user = parts[0].strip()
-            except: pass
-            notify_tg(False, email=user, error_msg=f"脚本异常: {str(e)[:200]}")
-            all_ok = False
-        if idx < len(accounts) - 1:
-            time.sleep(random.randint(5, 15))
-
-    if all_ok:
-        print("[INFO] 🎉 所有账号处理成功", flush=True)
-        sys.exit(0)
-    else:
-        print("[ERROR] 部分账号处理失败", flush=True)
+    if not raw_info:
+        log("INFO 环境变量未配置，退出", "ERROR")
         sys.exit(1)
+
+    # ── 解析 INFO 变量 (格式: url---id) ──────────────────────
+    tasks = []
+    lines = [line.strip() for line in raw_info.replace(",", "\n").splitlines() if line.strip()]
+    
+    for line in lines:
+        if "---" in line:
+            parts = line.split("---", 1)
+            target_url = parts[0].strip()
+            input_id = parts[1].strip()
+            tasks.append((target_url, input_id))
+        else:
+            log(f"格式错误，忽略此行 (缺少 '---')", "WARN") # 脱敏忽略的行内容
+
+    if not tasks:
+        log("没有解析到有效的任务，退出", "ERROR")
+        sys.exit(1)
+
+    log(f"成功解析到 {len(tasks)} 个任务")
+
+    # ── 启动虚拟显示 ─────────────────────────────────────────
+    vdisplay = Xvfb(width=1280, height=720, colordepth=24)
+    vdisplay.start()
+
+    total_success = 0
+    try:
+        for idx, (target_url, input_id) in enumerate(tasks, 1):
+            log(f"\n{'#'*60}")
+            log(f"执行进度: {idx}/{len(tasks)}")
+            log(f"{'#'*60}")
+
+            ok = renew_single_id(target_url, input_id, tg_token, tg_chat_id)
+            if ok:
+                total_success += 1
+
+            if idx < len(tasks):
+                wait = random.randint(5, 15)
+                log(f"等待 {wait} 秒后处理下一个任务...")
+                time.sleep(wait)
+    finally:
+        vdisplay.stop()
+
+    log(f"\n全部完成：成功 {total_success}/{len(tasks)}")
+    if total_success < len(tasks):
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
