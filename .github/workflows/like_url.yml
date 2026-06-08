@@ -21,12 +21,34 @@ jobs:
         with:
           python-version: '3.10'
 
+      - name: 缓存 Python 依赖
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-v1
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: 缓存 Chrome 安装包
+        id: cache-chrome
+        uses: actions/cache@v4
+        with:
+          path: /tmp/google-chrome-stable_current_amd64.deb
+          key: google-chrome-stable-latest
+
       - name: 安装系统依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb ffmpeg unzip curl
+
+      - name: 下载 Chrome（仅未命中缓存时）
+        if: steps.cache-chrome.outputs.cache-hit != 'true'
+        run: |
           wget -q -O /tmp/google-chrome-stable_current_amd64.deb \
             https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+
+      - name: 安装 Chrome
+        run: |
           sudo dpkg -i /tmp/google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
 
       - name: 安装 Python 依赖
@@ -78,4 +100,4 @@ jobs:
           repository: ${{ github.repository }}
           delete_workflow_pattern: ${{ github.workflow }}
           retain_days: 0
-          keep_minimum_runs: 1
+          keep_minimum_runs: 2
