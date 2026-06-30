@@ -1,12 +1,8 @@
 name: Godlike 续期
 on:
-  #schedule:
-    #- cron: '0 */3 * * *'
+  schedule:
+    - cron: '0 */2 * * *'
   workflow_dispatch:
-
-permissions:
-  actions: write
-  contents: read
 
 jobs:
   add_time_job:
@@ -25,7 +21,7 @@ jobs:
 
       - name: 安装依赖
         run: |
-          pip install requests playwright
+          pip install requests playwright pynacl websockets
           playwright install --with-deps chromium
 
       - name: 安装并启动代理
@@ -37,8 +33,7 @@ jobs:
             exit 0
           fi
           
-          # 替换为 XTLS 官方最新版的 Xray-core
-          wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          wget -q https://github.com/oyz6/action/releases/download/proxy/Xray-linux-64.zip
           unzip -q Xray-linux-64.zip -d xray && chmod +x xray/xray
           
           python3 << 'PYEOF'
@@ -332,10 +327,22 @@ jobs:
       - name: 运行续期脚本
         env:
           GODLIKE_1: ${{ secrets.GODLIKE_1 }}
+          GODLIKE_2: ${{ secrets.GODLIKE_2 }}   
+          GODLIKE_3: ${{ secrets.GODLIKE_3 }}
+          GODLIKE_4: ${{ secrets.GODLIKE_4 }}
+          GODLIKE_5: ${{ secrets.GODLIKE_5 }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
         run: python renew.py
+
+#      - name: 上传截图
+#        if: always()
+#        uses: actions/upload-artifact@v4
+#        with:
+#          name: error-screenshots
+#          path: Godlike/*.png
 
       - name: 清理历史
         if: always()
