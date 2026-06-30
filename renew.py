@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
+"""
+Godlike 主机广告自动续期 + 开机脚本
+"""
 
-import os, sys, time, traceback, random
+import os, sys, time, traceback, random, json, re, asyncio
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional, Dict, List, Any
+from typing import Optional, Tuple
 
 import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+import websockets
+from playwright.sync_api import sync_playwright
 
 # ---------- 配置 ----------
-API_BASE = "https://panel.godlike.host"
-OUTPUT_DIR = Path("Godlike")
+FRONT_BASE = "https://ultra.panel.godlike.host"
+API_BASE = "https://panel.godlike.host/api/v2"
+LOGIN_URL = f"{FRONT_BASE}/login"
+OUTPUT_DIR = Path("scripts/Godlike")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 CN_TZ = timezone(timedelta(hours=8))
 
@@ -19,15 +25,19 @@ def cn_time():
     return datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 def mask_email(email: str) -> str:
+    """仅用于工作流日志"""
     if not email or "@" not in email:
         return "***"
     user, domain = email.split("@", 1)
-    return f"{user[:3]}***@{domain}"
+    domain_parts = domain.split(".")
+    masked_domain = "***." + domain_parts[-1] if len(domain_parts) >= 2 else "***"
+    return f"{user[:3]}***@{masked_domain}"
 
 def mask_server(server_id: str) -> str:
-    if not server_id or len(server_id) < 6:
+    """服务器ID脱敏：只显示前3位"""
+    if not server_id:
         return "***"
-    return f"{server_id[:3]}***{server_id[-3:]}"
+    return f"{server_id[:3]}***"
 
 def snapshot(name: str) -> str:
     return str(OUTPUT_DIR / f"{name}_{int(time.time())}.png")
@@ -35,26 +45,20 @@ def snapshot(name: str) -> str:
 def notify_tg(ok: bool, email: str = "", server: str = "",
               before: str = "", after: str = "",
               error_msg: str = "", screenshot: str = None):
+    """TG通知使用真实邮箱和服务器ID"""
     token = os.environ.get("TG_BOT_TOKEN")
     chat_id = os.environ.get("TG_CHAT_ID")
     if not token or not chat_id:
         return
 
-    msg = "✅ 续期成功\n\n" if ok else "❌ 续期失败\n\n"
+    msg = "✅ 续期+开机成功\n\n" if ok else "❌ 操作失败\n\n"
     if email:   msg += f"账号：{email}\n"
     if server:  msg += f"服务器：{server}\n"
     if ok:
-        if before and after:
-            msg += f"到期：{before} → {after}\n"
-        elif after:
-            msg += f"到期：{after}\n"
-        elif before:
-            msg += f"到期：{before}\n"
+        if after: msg += f"下次可续期：{after}\n"
     else:
         if error_msg: msg += f"原因：{error_msg}\n"
-        if before:    msg += f"上次到期：{before}\n"
-        if after:     msg += f"现在到期：{after}\n"
-    msg += "\nGodlike Host Auto Renew"
+    msg += f"\n时间：{cn_time()}\nGodlike Host Auto Renew"
 
     try:
         if screenshot and Path(screenshot).exists():
@@ -72,309 +76,470 @@ def notify_tg(ok: bool, email: str = "", server: str = "",
     except Exception as e:
         print(f"[WARN] TG 通知发送失败: {e}", flush=True)
 
-# ---------- Secret 与 Cookie 处理 ----------
-def parse_raw_cookies(raw_cookie_str: str) -> List[Dict]:
-    """解析原生 Cookie 字符串，仅提取登录必需的核心 Cookie"""
-    if not raw_cookie_str:
-        return []
-    
-    # 防止用户不小心复制了 "Cookie: " 请求头前缀
-    if raw_cookie_str.lower().startswith("cookie: "):
-        raw_cookie_str = raw_cookie_str[8:]
-        
-    valid_cookies = []
-    
-    for item in raw_cookie_str.split(';'):
-        item = item.strip()
-        if not item or '=' not in item:
-            continue
-            
-        key, value = item.split('=', 1)
-        key = key.strip()
-        value = value.strip()
-        
-        # 仅保留 Pterodactyl 面板核心的会话/认证 Cookie
-        if key in ["pterodactyl_session", "XSRF-TOKEN"] or key.startswith("remember_web_"):
-            valid_cookies.append({
-                "name": key,
-                "value": value,
-                "domain": "panel.godlike.host",
-                "path": "/",
-                "secure": True
-            })
-            
-    return valid_cookies
+# ---------- 登录并获取 Bearer Token + UUID ----------
+def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    bearer_token = None
+    full_uuid = None
+    short_id = None
 
-def parse_secret(raw: str) -> Dict[str, Any]:
-    parts = raw.strip().split("-----")
-    if len(parts) < 2:
-        raise ValueError("格式错误：必须提供账号和 Cookie 数据 (格式: 账号-----完整的Cookie字符串)")
-    
-    user = parts[0].strip()
-    # 剩下的部分全部拼接为 Cookie 字符串，防止 Cookie 本身包含 "-----" 导致被错误截断
-    raw_cookie = "-----".join(parts[1:]).strip()
-    
-    cookies = parse_raw_cookies(raw_cookie)
-    if not cookies:
-        print("[WARN] 警告：未能从提供的字符串中提取到核心登录 Cookie，请检查内容。", flush=True)
-            
-    return {"user": user, "cookies": cookies}
+    def on_request(request):
+        nonlocal bearer_token, full_uuid, short_id
+        auth = request.headers.get("authorization", "")
+        if auth.startswith("Bearer ") and "ptlc_" in auth:
+            token = auth.replace("Bearer ", "").strip()
+            if bearer_token != token:
+                bearer_token = token
+        url = request.url
+        m = re.search(r'/servers/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', url)
+        if m and not full_uuid:
+            full_uuid = m.group(1)
+            short_id = full_uuid.split('-')[0]
 
-# ---------- API 交互 ----------
-def api_get_servers(session: requests.Session) -> Optional[List[Dict]]:
-    try:
-        r = session.get(f"{API_BASE}/api/client",
-                        params={"page": 1, "sort": "creation", "asc": "true"},
-                        headers={"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"},
-                        timeout=30)
-        r.raise_for_status()
-        return r.json().get("data", [])
-    except Exception as e:
-        print(f"[ERROR] 获取服务器列表失败: {e}", flush=True)
-        return None
-
-def find_free_server(servers: List[Dict]) -> Optional[Dict]:
-    for srv in servers:
-        if srv["attributes"].get("free"):
-            return srv
-    return None
-
-def get_free_timer(session: requests.Session, uuid: str) -> Optional[str]:
-    servers = api_get_servers(session)
-    if servers:
-        for srv in servers:
-            if srv["attributes"]["uuid"] == uuid:
-                return srv["attributes"]["free_timer"]
-    return None
-
-def calc_remaining(timer: str) -> str:
-    if not timer:
-        return "未知"
-    try:
-        expire = datetime.fromisoformat(timer.replace("Z", "+00:00"))
-        delta = expire - datetime.now(timezone.utc)
-        secs = int(delta.total_seconds())
-        if secs <= 0:
-            return "已过期"
-        d, rem = divmod(secs, 86400)
-        h, rem = divmod(rem, 3600)
-        m = rem // 60
-        parts = []
-        if d: parts.append(f"{d}天")
-        if h: parts.append(f"{h}小时")
-        if m: parts.append(f"{m}分钟")
-        return " ".join(parts) if parts else "<1分钟"
-    except:
-        return timer
-
-# ---------- Cookie 辅助 ----------
-def session_from_cookies(cookie_list: List[Dict]) -> requests.Session:
-    s = requests.Session()
-    for c in cookie_list:
-        s.cookies.set(
-            c.get("name"), c.get("value"),
-            domain=c.get("domain", "panel.godlike.host"),
-            path=c.get("path", "/"),
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            proxy={"server": proxy} if proxy else None,
+            args=["--no-sandbox", "--disable-setuid-sandbox"]
         )
-    return s
+        context = browser.new_context(
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+        )
+        page = context.new_page()
+        page.on("request", on_request)
 
-def test_cookie_valid(session: requests.Session) -> bool:
-    try:
-        r = session.get(f"{API_BASE}/api/client",
-                        params={"page": 1},
-                        headers={"Accept": "application/json"},
-                        timeout=15)
-        return r.status_code == 200 and "data" in r.json()
-    except:
-        return False
-
-def safe_add_cookies(page, cookies):
-    if cookies:
-        page.context.add_cookies(cookies)
-        print(f"[INFO] 成功注入 {len(cookies)} 个核心 Cookie", flush=True)
-        print("[INFO] 刷新页面验证登录状态...", flush=True)
-        page.goto(API_BASE, wait_until="domcontentloaded")
-        page.wait_for_timeout(3000)
-
-# ---------- 续期操作 ----------
-def do_renewal(page, server_short_id: str, max_retries: int = 3) -> bool:
-    url = f"{API_BASE}/server/{server_short_id}"
-    for attempt in range(1, max_retries + 1):
         try:
-            if attempt == 1:
-                print("[INFO] 访问服务器页面...", flush=True)
-                page.goto(url, wait_until="domcontentloaded")
-            else:
-                print(f"[INFO] 第{attempt}次重试，刷新页面...", flush=True)
-                page.reload(wait_until="domcontentloaded")
+            page.goto(LOGIN_URL, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+
+            switch = page.locator('button:has-text("Through login/password")')
+            switch.wait_for(state="visible", timeout=15000)
+            switch.click()
+            page.wait_for_timeout(2000)
+
+            page.locator('input[placeholder="Username or Email"]').wait_for(state="visible", timeout=15000)
+            page.locator('input[placeholder="Password"]').wait_for(state="visible", timeout=15000)
+            page.fill('input[placeholder="Username or Email"]', user)
+            page.fill('input[placeholder="Password"]', pwd)
+
+            for sel in ['button[type="submit"]', 'button:has-text("Login")']:
+                try:
+                    btn = page.locator(sel).first
+                    if btn.is_visible():
+                        btn.click(timeout=5000)
+                        break
+                except:
+                    pass
 
             page.wait_for_timeout(5000)
 
-            # 检查是否仍然有前端错误
-            error_selectors = [
-                'text="An error was encountered"',
-                'text="error was encountered"',
-                'text="Try refreshing the page"'
-            ]
-            has_error = False
-            for sel in error_selectors:
-                loc = page.locator(sel)
-                if loc.count() > 0:
-                    print(f"[WARN] 检测到页面错误: {sel}，将重试...", flush=True)
-                    has_error = True
+            for _ in range(5):
+                for sel in ['button:has-text("Go to my server")', 'button:has-text("Skip")']:
+                    try:
+                        el = page.locator(sel)
+                        if el.count() > 0 and el.first.is_visible():
+                            el.first.click()
+                            page.wait_for_timeout(2000)
+                            break
+                    except:
+                        pass
+                if '/server/' in page.url:
+                    break
+                page.wait_for_timeout(1000)
+
+            if not short_id:
+                if '/server/' in page.url:
+                    parts = page.url.rstrip('/').split('/')
+                    for i, p_part in enumerate(parts):
+                        if p_part == 'server' and i+1 < len(parts) and len(parts[i+1]) == 8:
+                            short_id = parts[i+1]
+                            break
+                if not short_id:
+                    links = page.locator('a[href*="/server/"]')
+                    for i in range(links.count()):
+                        href = links.nth(i).get_attribute("href") or ""
+                        parts = href.rstrip('/').split('/')
+                        for j, p_part in enumerate(parts):
+                            if p_part == 'server' and j+1 < len(parts) and len(parts[j+1]) == 8:
+                                short_id = parts[j+1]
+                                break
+                        if short_id:
+                            break
+
+            if short_id and not bearer_token:
+                page.goto(f"{FRONT_BASE}/server/{short_id}", wait_until="domcontentloaded")
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(3000)
+
+            if not full_uuid and short_id:
+                try:
+                    html = page.content()
+                    m = re.search(
+                        rf'{re.escape(short_id)}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}',
+                        html
+                    )
+                    if m:
+                        full_uuid = m.group(0)
+                except:
+                    pass
+
+            return bearer_token, full_uuid, short_id
+
+        except Exception as e:
+            print(f"[ERROR] 登录异常: {e}", flush=True)
+            traceback.print_exc()
+            return None, None, None
+        finally:
+            context.close()
+            browser.close()
+
+# ---------- API 公共 headers ----------
+def api_headers(bearer_token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {bearer_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": FRONT_BASE,
+        "Referer": f"{FRONT_BASE}/",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+
+# ---------- 检查续期状态 ----------
+def check_video_status(full_uuid: str, bearer_token: str) -> dict:
+    url = f"{API_BASE}/servers/{full_uuid}/free-renewal/video/status?type=youtube_iter1&locale=en"
+    try:
+        resp = requests.get(url, headers=api_headers(bearer_token), timeout=30)
+        return resp.json()
+    except Exception as e:
+        print(f"[ERROR] 状态查询失败: {e}", flush=True)
+        return {}
+
+# ---------- 调用 start API ----------
+def call_video_start(full_uuid: str, bearer_token: str) -> dict:
+    url = f"{API_BASE}/servers/{full_uuid}/free-renewal/video/start?locale=en"
+    body = {"type": "youtube_iter1"}
+    try:
+        resp = requests.post(url, headers=api_headers(bearer_token), json=body, timeout=30)
+        return resp.json()
+    except Exception as e:
+        print(f"[ERROR] Start API失败: {e}", flush=True)
+        return {}
+
+# ---------- 单次 update-time ----------
+def call_update_once(full_uuid: str, bearer_token: str,
+                     watch_uuid: str, renewal_id: int,
+                     video_time: int) -> dict:
+    url = f"{API_BASE}/servers/{full_uuid}/free-renewal/video/update-time?locale=en"
+    body = {
+        "uuid": watch_uuid,
+        "renewal_uuid": watch_uuid,
+        "renewal_id": renewal_id,
+        "video_time_watched": video_time,
+    }
+    try:
+        resp = requests.post(url, headers=api_headers(bearer_token), json=body, timeout=30)
+        return resp.json()
+    except Exception as e:
+        print(f"[ERROR] update-time异常: {e}", flush=True)
+        return {}
+
+# ---------- 模拟视频观看 ----------
+def simulate_video_watching(full_uuid: str, bearer_token: str,
+                             watch_uuid: str, renewal_id: int) -> Tuple[bool, str]:
+    steps = [30, 60, 90, 120, 150, 180, 210, 240]
+    wait_seconds = 28
+    total = len(steps) * wait_seconds
+
+    print(f"[INFO] 开始续期（共{len(steps)}步 × {wait_seconds}s，预计{total}s）", flush=True)
+
+    last_resp = {}
+    for i, video_time in enumerate(steps):
+        print(f"[INFO] 步骤 {i+1}/{len(steps)} 等待{wait_seconds}s → 上报{video_time}s", flush=True)
+        time.sleep(wait_seconds)
+
+        resp = call_update_once(full_uuid, bearer_token, watch_uuid, renewal_id, video_time)
+        last_resp = resp
+
+        success = resp.get("success", False)
+        msg = resp.get("message", "")
+        new_timer = resp.get("new_free_timer")
+
+        if not success:
+            if "Invalid time increment" in msg:
+                current = resp.get("current_time", 0)
+                if current > 0:
+                    adjusted = current + 30
+                    print(f"[WARN] 时间偏差，调整为{adjusted}s重试", flush=True)
+                    time.sleep(2)
+                    resp2 = call_update_once(full_uuid, bearer_token, watch_uuid, renewal_id, adjusted)
+                    if resp2.get("success"):
+                        last_resp = resp2
+                        new_timer = resp2.get("new_free_timer")
+                        steps[i+1:] = [adjusted + 30*(j+1) for j in range(len(steps)-i-1)]
+                        if new_timer:
+                            print(f"[INFO] ✅ 续期完成 new_free_timer={new_timer}", flush=True)
+                            return True, new_timer
+                        continue
+                    return False, resp2.get("message", "重试失败")
+            return False, msg
+
+        if new_timer:
+            print(f"[INFO] ✅ 续期完成 new_free_timer={new_timer}", flush=True)
+            return True, new_timer
+
+    new_timer = last_resp.get("new_free_timer")
+    if last_resp.get("success"):
+        return True, new_timer or "续期已提交"
+    return False, last_resp.get("message", "未知错误")
+
+# ---------- 获取 WS JWT ----------
+def get_websocket_credentials(full_uuid: str, bearer_token: str) -> Tuple[Optional[str], Optional[str]]:
+    url = f"{API_BASE}/servers/{full_uuid}/websocket?locale=en"
+    try:
+        resp = requests.get(url, headers=api_headers(bearer_token), timeout=30)
+        if resp.status_code == 200:
+            data = resp.json().get("data", resp.json())
+            return data.get("token"), data.get("socket")
+        print(f"[ERROR] WS凭证获取失败: {resp.status_code}", flush=True)
+        return None, None
+    except Exception as e:
+        print(f"[ERROR] 获取WS凭证异常: {e}", flush=True)
+        return None, None
+
+# ---------- WebSocket 开机 ----------
+async def ws_start_server(socket_url: str, jwt: str) -> str:
+    """
+    返回值:
+      "already_running" - 服务器已在运行，无需开机
+      "started"         - 已发送开机指令并确认启动
+      "sent"            - 已发送开机指令，等待超时但指令已发出
+      "auth_failed"     - WS认证失败
+      "error"           - 其他异常
+    """
+    print(f"[INFO] 连接 WebSocket...", flush=True)
+    try:
+        async with websockets.connect(
+            socket_url,
+            origin="https://ultra.panel.godlike.host",
+            additional_headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+            },
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=10,
+        ) as ws:
+            # 认证
+            await ws.send(json.dumps({"event": "auth", "args": [jwt]}))
+
+            auth_success = False
+            for _ in range(10):
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=10)
+                    data = json.loads(msg)
+                    if data.get("event") == "auth success":
+                        auth_success = True
+                        print("[INFO] ✅ WS认证成功", flush=True)
+                        break
+                except asyncio.TimeoutError:
                     break
 
-            if has_error and attempt < max_retries:
-                continue
-            elif has_error and attempt == max_retries:
-                print("[ERROR] 多次重试后页面仍存在错误", flush=True)
-                page.screenshot(path=snapshot("renewal_page_error"))
-                return False
+            if not auth_success:
+                print("[ERROR] WS认证失败", flush=True)
+                return "auth_failed"
 
-            # 等待续期按钮
-            add_btn = page.locator('button:has-text("Add 90 minutes")')
-            add_btn.wait_for(state="visible", timeout=30000)
-            add_btn.click()
-            print("[INFO] 已点击 Add 90 minutes", flush=True)
+            # 收集服务器推送的初始状态（最多等 5s）
+            current_status = "unknown"
+            deadline = asyncio.get_event_loop().time() + 5
+            while asyncio.get_event_loop().time() < deadline:
+                remaining = deadline - asyncio.get_event_loop().time()
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                    data = json.loads(msg)
+                    event = data.get("event", "")
 
-            ad_btn = page.locator('button:has-text("Watch advertisment")')
-            ad_btn.wait_for(state="visible", timeout=10000)
-            ad_btn.click()
-            print("[INFO] 已点击 Watch advertisment", flush=True)
+                    if event == "status":
+                        current_status = data.get("args", ["unknown"])[0]
+                        print(f"[INFO] 服务器当前状态: {current_status}", flush=True)
+                        break
 
-            print("[INFO] 等待广告 120 秒...", flush=True)
-            time.sleep(120)
+                    elif event == "stats":
+                        try:
+                            state = json.loads(data["args"][0]).get("state", "")
+                            if state:
+                                current_status = state
+                                print(f"[INFO] 服务器当前状态: {current_status}", flush=True)
+                                break
+                        except Exception:
+                            pass
 
-            # 广告结束后刷新页面
-            page.reload(wait_until="domcontentloaded")
-            page.wait_for_timeout(3000)
-            return True
+                except asyncio.TimeoutError:
+                    break
+                except Exception:
+                    break
 
-        except PlaywrightTimeoutError:
-            print(f"[ERROR] 第{attempt}次：续期按钮未出现", flush=True)
-            if attempt < max_retries:
-                continue
-            page.screenshot(path=snapshot("renewal_not_found"))
-            return False
-        except Exception as e:
-            print(f"[ERROR] 续期异常 (重试{attempt}): {e}", flush=True)
-            if attempt < max_retries:
-                continue
-            page.screenshot(path=snapshot("renewal_error"))
-            return False
+            # 已在运行/启动中 → 无需发开机指令
+            if current_status in ("running", "starting"):
+                print(f"[INFO] 服务器已在运行中（{current_status}），无需开机", flush=True)
+                return "already_running"
 
-    return False
+            # 未运行 → 发送开机指令
+            await ws.send(json.dumps({"event": "set state", "args": ["start"]}))
+            print("[INFO] 已发送开机指令，等待启动...", flush=True)
 
-# ---------- 单账号流程 ----------
+            # 等待状态变更确认
+            for _ in range(60):
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                    data = json.loads(msg)
+                    event = data.get("event", "")
+
+                    if event == "status":
+                        new_status = data.get("args", [""])[0]
+                        print(f"[INFO] 状态变更: {new_status}", flush=True)
+                        if new_status in ("starting", "running"):
+                            print(f"[INFO] ✅ 服务器启动成功（{new_status}）", flush=True)
+                            return "started"
+
+                    elif event == "stats":
+                        try:
+                            state = json.loads(data["args"][0]).get("state", "")
+                            if state in ("starting", "running"):
+                                print(f"[INFO] ✅ 服务器启动成功（{state}）", flush=True)
+                                return "started"
+                        except Exception:
+                            pass
+
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    break
+
+            print("[WARN] 等待超时，开机指令已发送", flush=True)
+            return "sent"
+
+    except Exception as e:
+        print(f"[ERROR] WebSocket异常: {e}", flush=True)
+        return "error"
+
+
+def start_server_via_ws(full_uuid: str, bearer_token: str) -> str:
+    jwt, socket_url = get_websocket_credentials(full_uuid, bearer_token)
+    if not jwt or not socket_url:
+        print("[ERROR] 无法获取WS凭证", flush=True)
+        return "error"
+    try:
+        return asyncio.run(ws_start_server(socket_url, jwt))
+    except Exception as e:
+        print(f"[ERROR] WS开机异常: {e}", flush=True)
+        return "error"
+
+# ---------- 单账号主流程 ----------
 def process_account(key: str, proxy: str = None) -> bool:
     raw = os.environ.get(key, "").strip()
     if not raw:
         return True
 
     try:
-        sec = parse_secret(raw)
-    except Exception as e:
-        print(f"[ERROR] {key} 格式错误: {e}", flush=True)
-        notify_tg(False, email="", error_msg=str(e))
+        parts = raw.split("-----")
+        user = parts[0].strip()
+        pwd = parts[1].strip()
+    except Exception:
+        print(f"[ERROR] {key} 格式错误", flush=True)
+        notify_tg(False, error_msg="格式错误")
         return False
 
-    user = sec["user"]
-    cookielist = sec["cookies"]
-    display_user = mask_email(user)
+    # 工作流日志使用脱敏值
+    masked = mask_email(user)
+    print(f"\n{'='*60}", flush=True)
+    print(f"[INFO] 处理 {key} ({masked})", flush=True)
+    print(f"{'='*60}", flush=True)
 
-    print(f"\n{'='*60}\n[INFO] 处理 {key} ({display_user})\n{'='*60}", flush=True)
-
-    if not cookielist:
-        print("[ERROR] 未提取到有效的核心 Cookie", flush=True)
-        notify_tg(False, email=user, error_msg="提取的 Cookie 无效，请检查提供的字符串")
+    # 1. 登录
+    bearer_token, full_uuid, short_id = login_and_get_token(user, pwd, proxy)
+    if not bearer_token:
+        print("[ERROR] 未能获取 Bearer Token", flush=True)
+        notify_tg(False, email=user, error_msg="未能获取 Bearer Token")
+        return False
+    if not full_uuid:
+        print("[ERROR] 未能获取服务器 UUID", flush=True)
+        notify_tg(False, email=user, error_msg="未能获取服务器 UUID")
         return False
 
-    # 验证 Cookie
-    session = session_from_cookies(cookielist)
-    if test_cookie_valid(session):
-        print("[INFO] 🍪 Cookie 登录验证成功", flush=True)
+    # 工作流日志中服务器ID也脱敏
+    masked_server = mask_server(short_id)
+    print(f"[INFO] 🔑 登录成功 | 服务器: {masked_server}", flush=True)
+
+    # 2. 检查续期状态
+    status = check_video_status(full_uuid, bearer_token)
+    can_watch = status.get("can_watch", None)
+    time_until_next = status.get("time_until_next_video") or 0
+
+    renew_ok = False
+    cooldown_after = ""
+
+    if not can_watch and time_until_next > 0:
+        h = time_until_next // 3600
+        m = (time_until_next % 3600) // 60
+        cooldown_after = f"{h}h {m}m"
+        print(f"[INFO] 已在冷却期，下次可续期: {cooldown_after}", flush=True)
+        renew_ok = True
     else:
-        print("[ERROR] Cookie 已失效，无法登录", flush=True)
-        notify_tg(False, email=user, error_msg="Cookie 已失效，请手动更新环境变量")
-        return False
-
-    # 获取服务器
-    servers = api_get_servers(session)
-    if not servers:
-        notify_tg(False, email=user, error_msg="无法获取服务器列表")
-        return False
-    srv = find_free_server(servers)
-    if not srv:
-        notify_tg(False, email=user, error_msg="未找到免费服务器")
-        return False
-
-    uuid = srv["attributes"]["uuid"]
-    short_id = srv["attributes"]["identifier"]
-    before = calc_remaining(srv["attributes"].get("free_timer"))
-    print(f"服务器: {mask_server(uuid)}, 续期前剩余: {before}", flush=True)
-
-    if before == "已过期":
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, proxy={"server": proxy} if proxy else None)
-            page = browser.new_page()
-            safe_add_cookies(page, cookielist)
-            page.goto(f"{API_BASE}/server/{short_id}", wait_until="domcontentloaded")
-            page.wait_for_timeout(3000)
-            ss_path = snapshot("expired")
-            page.screenshot(path=ss_path)
-            browser.close()
-        notify_tg(False, email=user, server=short_id, before=before,
-                  error_msg="服务器已过期，无法续期", screenshot=ss_path)
-        return False
-
-    # 续期
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, proxy={"server": proxy} if proxy else None)
-        page = browser.new_page()
-        success_ss = None
-        try:
-            safe_add_cookies(page, cookielist)
-            if not do_renewal(page, short_id):
-                fail_ss = snapshot("renewal_fail")
-                page.screenshot(path=fail_ss)
-                notify_tg(False, email=user, server=short_id, before=before,
-                          error_msg="续期点击失败", screenshot=fail_ss)
-                return False
-
-            after = calc_remaining(get_free_timer(session, uuid))
-            print(f"[INFO] 续期后剩余: {after}", flush=True)
-
-            success_ss = snapshot("success")
-            page.screenshot(path=success_ss)
-
-            notify_tg(True, email=user, server=short_id, before=before, after=after,
-                      screenshot=success_ss)
-            print(f"[INFO] ✅ {key} 续期成功", flush=True)
-            return True
-
-        except Exception as e:
-            print(f"[ERROR] 续期流程异常: {e}", flush=True)
-            traceback.print_exc()
-            exc_ss = snapshot("exception")
-            try:
-                page.screenshot(path=exc_ss)
-            except:
-                pass
-            notify_tg(False, email=user, server=short_id, before=before,
-                      error_msg=f"脚本异常: {str(e)[:200]}", screenshot=exc_ss)
+        # 3. 续期
+        start_resp = call_video_start(full_uuid, bearer_token)
+        if not start_resp.get("success"):
+            err = start_resp.get("message", "start API失败")
+            print(f"[ERROR] 续期启动失败: {err}", flush=True)
+            notify_tg(False, email=user, server=short_id, error_msg=err)
             return False
-        finally:
-            if success_ss is None:
-                try:
-                    page.screenshot(path=snapshot("final_error"))
-                except:
-                    pass
-            browser.close()
+
+        watch_uuid = start_resp.get("uuid", "")
+        renewal_id = start_resp.get("renewal_id", 0)
+        print(f"[INFO] 续期会话已建立 (renewal_id={renewal_id})", flush=True)
+
+        renew_ok, result = simulate_video_watching(full_uuid, bearer_token, watch_uuid, renewal_id)
+
+        if not renew_ok:
+            print(f"[ERROR] 续期失败: {result}", flush=True)
+            notify_tg(False, email=user, server=short_id, error_msg=result)
+            return False
+
+        # 确认冷却时间
+        time.sleep(2)
+        status_after = check_video_status(full_uuid, bearer_token)
+        time_until = status_after.get("time_until_next_video") or 0
+        h = time_until // 3600
+        m_min = (time_until % 3600) // 60
+        cooldown_after = f"{h}h {m_min}m" if time_until > 0 else result
+        print(f"[INFO] 续期成功，下次可续期: {cooldown_after}", flush=True)
+
+    # 4. WS 开机
+    print(f"[INFO] ── 开机 ──", flush=True)
+    start_result = start_server_via_ws(full_uuid, bearer_token)
+
+    start_note_map = {
+        "already_running": "✅ 服务器已在运行中，无需开机",
+        "started":         "✅ 开机成功",
+        "sent":            "✅ 开机指令已发送（等待超时）",
+        "auth_failed":     "⚠️ WS认证失败",
+        "error":           "⚠️ 开机异常",
+    }
+    start_note = start_note_map.get(start_result, "⚠️ 未知状态")
+    print(f"[INFO] {start_note}", flush=True)
+
+    # 5. TG 通知（使用真实邮箱和服务器ID）
+    notify_tg(
+        ok=renew_ok,
+        email=user,
+        server=short_id,
+        after=f"{cooldown_after}\n{start_note}",
+    )
+
+    print(f"[INFO] ✅ {key} 处理完成", flush=True)
+    return renew_ok
 
 def main():
     proxy = os.environ.get("PROXY_SERVER", "")
     if proxy:
-        print(f"[INFO] 代理: {proxy}", flush=True)
+        print(f"[INFO] 使用代理", flush=True)
 
     accounts = [f"GODLIKE_{i}" for i in range(1, 6)]
     all_ok = True
@@ -386,23 +551,16 @@ def main():
         except Exception as e:
             print(f"[FATAL] {acc} 崩溃: {e}", flush=True)
             traceback.print_exc()
-            user = ""
-            try:
-                raw = os.environ.get(acc, "")
-                if raw:
-                    parts = raw.split("-----")
-                    if parts: user = parts[0].strip()
-            except: pass
-            notify_tg(False, email=user, error_msg=f"脚本异常: {str(e)[:200]}")
+            notify_tg(False, email=acc, error_msg=f"脚本崩溃: {str(e)[:200]}")
             all_ok = False
         if idx < len(accounts) - 1:
             time.sleep(random.randint(5, 15))
 
     if all_ok:
-        print("[INFO] 🎉 所有账号处理成功", flush=True)
+        print("\n[INFO] 🎉 所有账号处理成功", flush=True)
         sys.exit(0)
     else:
-        print("[ERROR] 部分账号处理失败", flush=True)
+        print("\n[ERROR] 部分账号失败", flush=True)
         sys.exit(1)
 
 if __name__ == "__main__":
